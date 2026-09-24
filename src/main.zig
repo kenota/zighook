@@ -36,46 +36,55 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-const Headers = struct {
-    // Type of the github zig hook event
-    Event: []const u8,
-    Sha256Signature: []const u8,
-    IsJsonType: bool,
+const EventType = enum {
+    PUSH,
+    UNKNOWN,
+};
 
-    fn init(alloc: std.mem.Allocator, req: *const std.http.Server.Request) !Headers {
-        const eventHeader = "x-github-event";
-        const sha256Header = "x-hub-signature-256";
+const sigLen = 64;
+const emptySig: [sigLen]u8 = @splat(' ');
 
-        var res = Headers{
-            .Event = "",
-            .Sha256Signature = "",
-            .IsJsonType = false,
+const HookHeaders = struct {
+    event: EventType,
+    signature: [sigLen]u8,
+    isJson: bool,
+
+    pub fn init() HookHeaders {
+        return HookHeaders{
+            .event = .UNKNOWN,
+            .signature = emptySig,
+            .isJson = false,
         };
-        var iter = req.iterateHeaders();
-        while (iter.next()) |h| {
-            var buf: [256]u8 = undefined;
-
-            // Ignore big headers
-            if (h.name.len > buf.len) {
-                log.warn("Received large header: {s} max allowed length: {d}", .{ h.name, buf.len });
-            }
-            _ = std.ascii.lowerString(&buf, h.name);
-
-            if (std.mem.eql(u8, eventHeader, buf[0..h.name.len])) {
-                res.Event = try alloc.dupe(u8, h.value);
-            }
-            if (std.mem.eql(u8, sha256Header, buf[0..h.name.len])) {
-                res.Sha256Signature = try alloc.dupe(u8, h.value);
-            }
-        }
-        return res;
     }
 
-    fn deinit(headers: *Headers, alloc: std.mem.Allocator) void {
-        alloc.free(headers.Event);
-        alloc.freE(headers.Sha256Signature);
+    pub fn isValid(headers: HookHeaders) bool {
+        return headers.event == .PUSH and headers.isJson and
+            !(std.mem.eql(u8, &headers.signature, &emptySig));
     }
 };
+
+fn parseHookHeaders(req: *const std.http.Server.Request) HookHeaders {
+    const eventHeader = "x-github-event";
+    const sha256Header = "x-hub-signature-256";
+
+    var res: HookHeaders = .init();
+    var iter = req.iterateHeaders();
+    while (iter.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(eventHeader, h.name) and std.ascii.eqlIgnoreCase(h.value, "push")) {
+            res.event = .PUSH;
+        } else if (std.ascii.eqlIgnoreCase(sha256Header, h.name)) {
+            var hash = std.mem.splitSequence(u8, h.value, "sha256=");
+            _ = hash.first();
+            if (hash.rest().len == sigLen) {
+                @memmove(&res.signature, hash.rest()[0..res.signature.len]);
+            }
+        } else if (std.ascii.eqlIgnoreCase("content-type", h.name) and std.ascii.eqlIgnoreCase("application/json", h.value)) {
+            res.isJson = true;
+        }
+    }
+
+    return res;
+}
 
 fn accept(stream: net.Stream, io: Io, alloc: std.mem.Allocator) error{Canceled}!void {
     var arena: std.heap.ArenaAllocator = .init(alloc);
@@ -103,8 +112,11 @@ fn accept(stream: net.Stream, io: Io, alloc: std.mem.Allocator) error{Canceled}!
             },
         }
 
-        const hookHeaders = Headers.init(arena.allocator(), &request) catch Headers{ .Event = "", .Sha256Signature = "", .IsJsonType = false };
-        log.debug("event type: {s} hash: {s}", .{ hookHeaders.Event, hookHeaders.Sha256Signature });
+        const hHeaders = parseHookHeaders(&request);
+        if (hHeaders.isValid()) {
+            log.info("got valid header, reading body", .{});
+            server.reader.bodyReaderDecompressing(transfer_buffer: []u8, transfer_encoding: TransferEncoding, content_length: ?u64, content_encoding: ContentEncoding, decompress: *Decompress, decompress_buffer: []u8)
+        }
 
         // lets just send ok
         request.respond("Hello world", .{}) catch |err| {
