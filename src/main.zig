@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const log = std.log;
 const net = std.Io.net;
+const hmac = std.crypto.auth.hmac;
 
 const zighook = @import("zighook");
 
@@ -23,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
     defer group.cancel(io);
 
     log.info("Starting webserver on port {d}", .{port});
-    const addr = try net.IpAddress.parse("127.0.0.1", port);
+    const addr = try net.IpAddress.parse("0.0.0.0", port);
     var server = try addr.listen(io, .{ .reuse_address = true });
 
     while (true) {
@@ -115,7 +116,26 @@ fn accept(stream: net.Stream, io: Io, alloc: std.mem.Allocator) error{Canceled}!
         const hHeaders = parseHookHeaders(&request);
         if (hHeaders.isValid()) {
             log.info("got valid header, reading body", .{});
-            server.reader.bodyReaderDecompressing(transfer_buffer: []u8, transfer_encoding: TransferEncoding, content_length: ?u64, content_encoding: ContentEncoding, decompress: *Decompress, decompress_buffer: []u8)
+            var buf: [8192]u8 = undefined;
+            var body: [8129]u8 = undefined;
+
+            var r = server.reader.bodyReader(&buf, request.head.transfer_encoding, request.head.content_length);
+
+            const bytesRead = r.readSliceShort(&body) catch |err| {
+                log.err("Error reading body: {s}", .{@errorName(err)});
+                return;
+            };
+            // Check the HMAC signature
+            var calculated: [hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+            hmac.sha2.HmacSha256.create(&calculated, body[0..bytesRead], "thisistest");
+
+            const calculated_hex = std.fmt.bytesToHex(calculated, .lower);
+
+            if (std.mem.eql(u8, calculated_hex[0..], &hHeaders.signature)) {
+                log.info("signatures match", .{});
+            } else {
+                log.info("signatures do not match. Calculated: {s} received: {s}", .{ calculated_hex[0..], hHeaders.signature });
+            }
         }
 
         // lets just send ok
